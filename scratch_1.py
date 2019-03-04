@@ -28,7 +28,8 @@ sql_dir = 'sq_databases/'
 genome_scores_fn = 'genome-scores'
 genome_tags_fn = 'genome-tags'
 links_fn = 'links'
-movies_fn = 'movies'
+# movies_fn = 'movies' --> Does not have IMDB data
+movies_fn = 'movies_updated'
 ratings_fn = 'ratings'
 tags_fn = 'tags'
 
@@ -344,6 +345,93 @@ tags_pd.to_sql('tags', engine, if_exists='append', index=False)
 ratings_pd.to_sql('ratings', engine, if_exists='append', index=False)
 
 #%%
+
+# Train recommendation engine using Spark's MLLib library
+
+from pyspark.ml.recommendation import ALS
+
+ratings_pd.drop(columns=['timestamp'], inplace=True)
+
+# First perform some training time analysis. Note that num_iterations is set
+# to 10 for the training algorithm.
+
+train_time_data = pd.DataFrame(columns=['num_users', 'total_obs', 
+                                        'num_features', 'train_time_sec', 
+                                        'model_type'])
+
+all_users = ratings_pd.userId.unique()
+
+num_users_list = [100, 500, 1000, 5000, 10000]
+
+dataset_sizes = []
+
+num_features = [10, 50, 100]
+
+# Perform analysis 5 times
+for i in range(5):
+    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    print('~~~~~~~~~~~ITERATION {}~~~~~~~~~~~~~'.format(i))
+    print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+    for num_users in num_users_list:
+        users = np.random.choice(all_users, num_users, replace=False)
+        ratings_subset_pd = ratings_pd[np.isin(ratings_pd.userId, users)]
+        dataset_sizes.append(ratings_subset_pd.shape[0])
+        print('Num Users: {}, Total Ratings: {}'.format(num_users, 
+                                                          dataset_sizes[-1]))
+        ratings_subset_df = spark.createDataFrame(ratings_subset_pd)
+        ratings_subset_df = ratings_subset_df.withColumn('imp_rating', 
+                                                         (ratings_subset_df.\
+                                                          rating>=4.0).cast('int'))
+        for nf in num_features:
+            als = ALS(rank=nf, userCol='userId', itemCol='movieId', 
+                      ratingCol='rating', seed=9, nonnegative=True)
+            print('Fitting {}-feature explicit model...'.format(nf))
+            start_time = time.time()
+            als.fit(ratings_subset_df)
+            elapsed_time = time.time()-start_time
+            new_data = {'num_users': num_users, 'total_obs':dataset_sizes[-1], 
+                        'num_features': nf, 'train_time_sec': elapsed_time,
+                        'model_type':'explicit'}
+            train_time_data = \
+                train_time_data.append(new_data, ignore_index=True)
+            print('Finished fitting model.\n Total elapsed time: {}'.format(
+                    np.round(elapsed_time, 2)))
+            #######
+            
+            als = ALS(rank=nf, userCol='userId', itemCol='movieId', nonnegative=True,
+                      ratingCol='imp_rating', implicitPrefs=True, seed=9)
+            print('Fitting {}-feature implicit model...'.format(nf))
+            start_time = time.time()
+            als.fit(ratings_subset_df)
+            elapsed_time = time.time()-start_time
+            new_data = {'num_users': num_users, 'total_obs':dataset_sizes[-1], 
+                        'num_features': nf, 'train_time_sec': elapsed_time,
+                        'model_type':'implicit'}
+            train_time_data = \
+                train_time_data.append(new_data, ignore_index=True)
+            print('Finished fitting model.\n Total elapsed time: {}'.format(
+                    np.round(elapsed_time, 2)))
+            print('############################\n')
+        print('**************************\n')
+        
+train_time_data.to_csv('datasets/train_time_data.csv',
+                                index=False)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
