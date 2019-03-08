@@ -417,6 +417,355 @@ for i in range(5):
 train_time_data.to_csv('datasets/train_time_data.csv',
                                 index=False)
 
+#%%
+
+# Analyze train time data.
+
+train_time_data = pd.read_csv('datasets/train_time_data.csv')
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.pipeline import Pipeline
+
+sns.lmplot(x='num_users', y='train_time_sec', hue='model_type', 
+           col='num_features', sharey=True, x_estimator=np.mean, 
+           scatter_kws={'alpha':0.5}, line_kws={'alpha':0.5}, x_ci='sd',
+           data=train_time_data)
+sns.lmplot(x='total_obs', y='train_time_sec', hue='model_type', 
+           col='num_features', sharey=True, x_estimator=np.mean, 
+           scatter_kws={'alpha':0.5}, line_kws={'alpha':0.5}, x_ci='sd',
+           data=train_time_data)
+
+X = train_time_data.query("model_type=='explicit'")[['total_obs', 'num_features']]
+y = train_time_data.query("model_type=='explicit'").train_time_sec
+
+lr_train_time = Pipeline([('poly', PolynomialFeatures(interaction_only=True,
+                                                include_bias=False)),
+                          ('lr', LinearRegression())])
+    
+lr_train_time.fit(X, y)
+
+# R^2 for this model is 0.95
+
+
+print(*zip(lr_train_time.steps[0][1].get_feature_names(), 
+           lr_train_time.steps[1][1].coef_))
+
+lr_total_obs = LinearRegression()
+lr_total_obs.fit(train_time_data[['num_users']], train_time_data.total_obs)
+
+# R^2 for this model is 0.99
+
+# num_features seems to have to largest effect
+
+# Now make predictions as to total training time.
+
+#Suppose that the training set has 100,000 users
+
+train_size = 0.7
+CV_splits = 3
+CV_train_size = train_size*(CV_splits-1)/CV_splits
+
+predicted_total_obs = lr_total_obs.predict(np.array([25000]).reshape(-1,1))*\
+                      CV_train_size
+
+
+lambdas_df = pd.DataFrame({'lambda':np.logspace(-3, 2, 6)})
+lambdas_df['key'] = 0
+# Include alphas if using implicit model
+#alphas_df = pd.DataFrame({'alpha':np.logspace(-1, 1, 3)})
+#alphas_df['key'] = 0
+num_features_df = pd.DataFrame({'rank':[25, 50, 75]})
+num_features_df['key'] = 0
+X_CV_params = pd.DataFrame({'key': 0, 'total_obs':predicted_total_obs})
+X_CV_params = X_CV_params.merge(lambdas_df, on='key')\
+                         .merge(num_features_df, on='key')\
+                         .loc[:, ['total_obs', 'rank', 'lambda']]
+
+predicted_times = lr_train_time.predict(X_CV_params[['total_obs', 'rank']])
+X_CV_params['predicted_times'] = predicted_times
+X_CV_params.predicted_times = X_CV_params.predicted_times.apply(lambda x:\
+                                                                0 if x<=0.0\
+                                                                else x)
+print('TOTAL ESTIMATED TRAINING TIME: {} hrs'.format(\
+      np.round(2*CV_splits*X_CV_params.predicted_times.sum()/3600,2)))
+
+# Will use the following params:
+#    train_size = 0.7
+#    CV_splits = 3
+#    num_users = 25000
+#    lambdas = np.logspace(-3, 2, 6)
+#    rank = [25, 50, 75]
+#    train_iterations = 20
+# Projected training time: 2.82 hours
+
+#%%
+
+# Train explicit recommendation engine.
+from pyspark.ml.recommendation import ALS
+from pyspark.ml.tuning import ParamGridBuilder, CrossValidator
+from pyspark.ml.evaluation import RegressionEvaluator
+import time
+
+# Uncomment below if not already dropped.
+# ratings_pd.drop(columns=['timestamp'], inplace=True)
+
+num_users = 25000
+
+all_users=ratings_pd.userId.unique()
+
+users = np.random.choice(all_users, num_users, replace=False)
+
+ratings_subset_pd = ratings_pd[np.isin(ratings_pd.userId, users)]
+
+# del ratings_pd
+
+ratings_df = spark.createDataFrame(ratings_subset_pd)
+
+ratings_train, ratings_test = ratings_df.randomSplit([0.7, 0.3], seed=9)
+
+als = ALS(maxIter=20, seed=9, userCol='userId', itemCol='movieId', 
+          ratingCol='rating', nonnegative=True, coldStartStrategy='drop')
+
+         
+rmse_evaluator = RegressionEvaluator(predictionCol='prediction', 
+                                     labelCol='rating', metricName='rmse')
+total_time = 0
+X_CV = X_CV_params.drop(columns=['total_obs', 'predicted_times'])
+X_CV['num_users'] = 25000
+X_CV['total_70_30_train_ratings'] = ratings_train.count()
+print('Predicted num ratings: {}; Actual num ratings: {}'.format(np.round(0.7*predicted_total_obs),
+      X_CV.loc[0, 'total_70_30_train_ratings']))
+num_param_combos = X_CV.shape[0]
+for i, params in X_CV.iterrows():
+    paramGrid = ParamGridBuilder()\
+         .baseOn([als.regParam, params[1]])\
+         .baseOn([als.rank, params[0]])\
+         .build()
+         
+    print('######################\n')
+    print('Cross-validating combination {}/{}......'.format(i+1, num_param_combos))
+    print('Params: regParam = {}; rank = {}'.format(params[1], params[0]))
+    start_time = time.time()
+    
+    ratings_cv = CrossValidator(estimator=als, estimatorParamMaps=paramGrid,
+                                evaluator=rmse_evaluator, numFolds=3, seed=9)
+    
+    ratings_cv_model = ratings_cv.fit(ratings_train)
+    elapsed_time = time.time()-start_time
+    print('Finished validating in {} seconds.\n'.format(np.round(elapsed_time,2)))
+    
+    X_CV.loc[i, 'avg_3fold_rmse'] = ratings_cv_model.avgMetrics[0]
+    X_CV.loc[i, 'validation_time'] = elapsed_time
+    X_CV.to_csv('datasets/CV3_tuning_session1.csv', index=False)
+    total_time +=elapsed_time
+    if (i+1)%5==0:
+        print('Total time elapsed: {} hrs'.format(np.round(total_time/3600, 2)))
+        
+# Best model is lambda = 0.1, rank = 75, though rank 50 achieves same rmse
+# up to 10e-4 error.
+
+# Retry with more fine-grained range for lambda, centered on 0.1.
+        
+# Should also resample users multiple times. Will also do 5-fold validation.
+        
+num_users = 25000
+
+train_size = 0.7
+CV_splits = 5
+
+
+lambdas_df = pd.DataFrame({'lambda':np.logspace(-1.5, -0.5, 5)})
+lambdas_df['key'] = 0
+user_group_df = pd.DataFrame({'user_group': [0,1,2,3,4]})
+user_group_df['key'] = 0
+# Include alphas if using implicit model
+#alphas_df = pd.DataFrame({'alpha':np.logspace(-1, 1, 3)})
+#alphas_df['key'] = 0
+#num_features_df = pd.DataFrame({'rank': [50]})
+#num_features_df['key'] = 0
+X_CV = pd.DataFrame({'key': 0, 'train_size':train_size, 'CV_splits': CV_splits,
+                     'num_iterations':20, 'num_users': num_users, 'rank':50}, index=[0])
+X_CV = X_CV.merge(lambdas_df, on='key')\
+           .merge(user_group_df, on='key')\
+           .loc[:, ['train_size', 'CV_splits', 'num_iterations',
+                    'user_group', 'num_users', 'rank', 'lambda']]
+X_CV = X_CV.sort_values(['user_group', 'lambda']).reset_index(drop=True)
+
+#all_users=ratings_pd.userId.unique()
+
+total_time = 0
+
+current_user_group = -1
+num_param_combos = X_CV.shape[0]
+
+for i, row in X_CV.iterrows():
+    
+    new_user_group = row.user_group
+    new_lambda = row['lambda']
+    
+    if new_user_group > current_user_group:
+        print('************************************')
+        print('************************************')
+        print('************************************')
+        print('BEGINNING USER GROUP {}...\n Drawing sample and counting ratings...'\
+              .format(new_user_group))
+        current_user_group = new_user_group
+        users = np.random.choice(all_users, num_users, replace=False)
+        
+        ratings_pd = pd.read_csv(data_dir + ratings_fn + '.csv')
+        ratings_pd.drop(columns='timestamp', inplace=True)
+
+        ratings_subset_pd = ratings_pd[np.isin(ratings_pd.userId, users)]
+        
+        del ratings_pd
+        
+        ratings_df = spark.createDataFrame(ratings_subset_pd)
+        
+        ratings_train, ratings_test = ratings_df.randomSplit([train_size,
+                                                              1-train_size])
+        user_group_ratings = ratings_train.count()
+        print('New user group has {} total ratings'.format(user_group_ratings))
+    
+    als = ALS(rank=50, maxIter=20, seed=9, userCol='userId', itemCol='movieId',
+              ratingCol='rating', nonnegative=True, coldStartStrategy='drop')
+    
+             
+    rmse_evaluator = RegressionEvaluator(predictionCol='prediction', 
+                                         labelCol='rating', metricName='rmse')
+    
+    X_CV.loc[i,'total_train_ratings'] = user_group_ratings
+    
+    paramGrid = ParamGridBuilder()\
+         .baseOn([als.regParam, new_lambda])\
+         .build()
+         
+    print('######################\n')
+    print('Cross-validating combination {}/{}......'.format(i+1, num_param_combos))
+    print('Params: regParam = {}'.format(new_lambda))
+    start_time = time.time()
+    
+    ratings_cv = CrossValidator(estimator=als, estimatorParamMaps=paramGrid,
+                                evaluator=rmse_evaluator, numFolds=CV_splits, seed=9)
+    
+    ratings_cv_model = ratings_cv.fit(ratings_train)
+    elapsed_time = time.time()-start_time
+    print('Finished validating in {} seconds.\n'.format(np.round(elapsed_time,2)))
+    
+    X_CV.loc[i, 'avg_CV_rmse'] = ratings_cv_model.avgMetrics[0]
+    X_CV.loc[i, 'validation_time'] = elapsed_time
+    X_CV.to_csv('datasets/explicit_tuning_session2.csv', index=False)
+    total_time +=elapsed_time
+    if (i+1)%5==0:
+        print('Total time elapsed: {} hrs'.format(np.round(total_time/3600, 2)))
+
+# Let's see how sensitive the algorithm is to the number of users on which it
+# is trained.
+
+train_size = 0.7
+CV_splits = 5
+
+
+num_users_df = pd.DataFrame({'num_users':[5000, 10000, 15000, 20000, 25000]})
+num_users_df['key'] = 0
+user_group_df = pd.DataFrame({'user_group': [0,1,2,3,4]})
+user_group_df['key'] = 0
+num_iterations_df = pd.DataFrame({'num_iterations':[10, 20]})
+num_iterations_df['key']=0
+# Include alphas if using implicit model
+#alphas_df = pd.DataFrame({'alpha':np.logspace(-1, 1, 3)})
+#alphas_df['key'] = 0
+#num_features_df = pd.DataFrame({'rank': [50]})
+#num_features_df['key'] = 0
+X_CV = pd.DataFrame({'key': 0, 'train_size':train_size, 'CV_splits': CV_splits,
+                     'lambda':0.1, 'rank':50}, index=[0])
+X_CV = X_CV.merge(num_users_df, on='key')\
+           .merge(user_group_df, on='key')\
+           .merge(num_iterations_df, on='key')\
+           .loc[:, ['train_size', 'CV_splits', 'num_iterations',
+                    'user_group', 'num_users', 'rank', 'lambda']]
+X_CV = X_CV.sort_values(['num_users', 'user_group', 
+                         'num_iterations']).reset_index(drop=True)
+
+#all_users=ratings_pd.userId.unique()
+
+total_time = 0
+
+current_num_users = -1
+num_param_combos = X_CV.shape[0]
+
+for i, row in X_CV.iterrows():
+    
+    new_num_users = row.num_users
+    new_user_group = row.user_group
+    new_num_iterations=row.num_iterations
+    
+    if new_num_users > current_num_users:
+        current_user_group = -1
+        current_num_users = new_num_users
+        print('############################################\n')
+        print('Now utilizing {} users per sample.'.format(new_num_users))
+    
+    if new_user_group > current_user_group:
+        print('************************************\n')
+        print('Drawing sample {}...\n'.format(new_user_group+1))
+        current_user_group = new_user_group
+        users = np.random.choice(all_users, int(new_num_users), replace=False)
+        
+        ratings_pd = pd.read_csv(data_dir + ratings_fn + '.csv')
+        ratings_pd.drop(columns='timestamp', inplace=True)
+
+        ratings_subset_pd = ratings_pd[np.isin(ratings_pd.userId, users)]
+        
+        del ratings_pd
+        
+        ratings_df = spark.createDataFrame(ratings_subset_pd)
+        
+        ratings_train, ratings_test = ratings_df.randomSplit([train_size,
+                                                              1-train_size])
+        user_group_movies = ratings_train.select('movieId').distinct().count()
+        user_group_users = ratings_train.select('userId').distinct().count()
+        user_group_ratings = ratings_train.count()
+        print('New user group has: {} total ratings\n'.format(user_group_ratings),
+              '{} total movies'.format(user_group_movies),
+              '{} total users'.format(user_group_users))
+    
+    als = ALS(rank=50, regParam=0.1, seed=9, userCol='userId', itemCol='movieId',
+              ratingCol='rating', nonnegative=True, coldStartStrategy='drop')
+    
+             
+    rmse_evaluator = RegressionEvaluator(predictionCol='prediction', 
+                                         labelCol='rating', metricName='rmse')
+    
+    X_CV.loc[i,'total_train_users'] = user_group_users
+    X_CV.loc[i,'total_train_movies'] = user_group_movies
+    X_CV.loc[i,'total_train_ratings'] = user_group_ratings
+    
+    paramGrid = ParamGridBuilder()\
+         .baseOn([als.maxIter, new_num_iterations])\
+         .build()
+         
+    print('######################\n')
+    print('Cross-validating combination {}/{}......'.format(i+1, num_param_combos))
+    print('Params: maxIter = {}'.format(new_num_iterations))
+    start_time = time.time()
+    
+    ratings_cv = CrossValidator(estimator=als, estimatorParamMaps=paramGrid,
+                                evaluator=rmse_evaluator, numFolds=CV_splits, seed=9)
+    
+    ratings_cv_model = ratings_cv.fit(ratings_train)
+    elapsed_time = time.time()-start_time
+    print('Finished validating in {} seconds.\n'.format(np.round(elapsed_time,2)))
+    
+    X_CV.loc[i, 'avg_CV_rmse'] = ratings_cv_model.avgMetrics[0]
+    X_CV.loc[i, 'validation_time'] = elapsed_time
+    X_CV.to_csv('datasets/explicit_tuning_session3.csv', index=False)
+    total_time +=elapsed_time
+    if (i+1)%5==0:
+        print('Total time elapsed: {} hrs'.format(np.round(total_time/3600, 2)))
+
 
 
 
