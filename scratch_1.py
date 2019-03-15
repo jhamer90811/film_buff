@@ -6,6 +6,11 @@ Film Buff *** scratch work
 Author: Jesse Hamer
 
 Date Created: 2/27/19
+
+Contains code for EDA, collecting movie data using OMBD API, building
+PostgreSQL database using sqlalchemy,
+and initial training/train-time analysis for PySpark's built-in ALS 
+recommendation engine.
 """
 
 import pandas as pd
