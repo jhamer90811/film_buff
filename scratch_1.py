@@ -772,12 +772,105 @@ for i, row in X_CV.iterrows():
         print('Total time elapsed: {} hrs'.format(np.round(total_time/3600, 2)))
 
 
+#%%
 
+# Scratch work to obtain test user who has rated several films with 5-stars.
+        
+from pyspark.sql.types import StructType,StructField,ArrayType,\
+                    IntegerType,FloatType, StringType
 
+from pyspark.sql.functions import struct, collect_list, col
+        
+ratings_schema = StructType([StructField('userId', IntegerType()), 
+                             StructField('movieId', IntegerType()), 
+                             StructField('rating', FloatType())])
+               
+ratings = spark.read.csv('datasets/ml-latest/ratings_1000_users.csv', 
+                         header=True, schema=ratings_schema)
 
+highly_rated = ratings.filter('rating=5.0')
 
+highly_rated.groupby('userId').count().sort(col('count').desc()).show()
 
+# 127765 has 228 5-star ratings
+# 153049 has 225 5-star ratings
+# 244513 has 197 5-star ratings
 
+test_user = highly_rated.filter('userId=127765').select('movieId')
+
+movies_schema = StructType([StructField('movieId',IntegerType()),
+                            StructField('title',StringType()),
+                            StructField('genres',StringType()),
+                            StructField('year',StringType()),
+                            StructField('rated',StringType()),
+                            StructField('runtime',StringType()),
+                            StructField('director',StringType()),
+                            StructField('writer',StringType()),
+                            StructField('actors',StringType()),
+                            StructField('plot',StringType()),
+                            StructField('language',StringType()),
+                            StructField('country',StringType()),
+                            StructField('awards',StringType()),
+                            StructField('imdb_rating',FloatType()),
+                            StructField('imdb_votes',FloatType())])
+
+movies = spark.read.csv('datasets/ml-latest/movies_updated.csv',
+                        header=True, schema=movies_schema)
+
+test_user = test_user.join(movies, on='movieId', how='left')
+
+genome_scores = spark.read.csv('datasets/ml-latest/genome-scores.csv', 
+                               header=True)
+
+genome_tags = spark.read.csv('datasets/ml-latest/genome-tags.csv',
+                             header=True)
+genomes = genome_scores.join(genome_tags, on='tagId', how='left')
+
+genomes = genomes.withColumn('tagId_tag_relevance', 
+                             struct('tagId', 'tag', 'relevance'))\
+                 .select('movieId', 'tagId_tag_relevance')
+                 
+genomes = genomes.groupby('movieId').agg(collect_list('tagId_tag_relevance')\
+                                          .alias('genome'))
+
+test_user = test_user.join(genomes, on='movieId', how='left')
+
+test_user_pd = test_user.toPandas()
+
+test_user_genomes = test_user_pd[['movieId', 'genome']]
+test_user_genomes.genome = test_user_genomes.genome\
+                                            .apply(lambda x: [(int(t[0]),
+                                                               t[1], 
+                                                               float(t[2])) \
+                                                               for t in x])\
+                                            .apply(lambda x: sorted(x,
+                                                                    key=\
+                                                                    lambda g:\
+                                                                    g[0]))\
+                                            .apply(lambda x: [(r[1], r[2]) for\
+                                                              r in x])
+               
+temp_df = pd.DataFrame([])
+
+for _, row in test_user_genomes.iterrows():
+    movieId = row[0]
+    genome = row[1]
+    tags = [r[0] for r in genome]
+    relevances = [r[1] for r in genome]
+    
+    relevance_series = pd.Series(data=relevances, index=tags, name=movieId)
+    temp_df = temp_df.append(relevance_series)
+    
+test_user_genomes = temp_df
+test_user_genomes.index.name = 'movieId'
+test_user_genomes.reset_index(inplace=True)
+
+test_user_pd.drop(columns='genome',inplace=True)
+
+test_user_pd.to_csv('datasets/collection_info_127765.csv', index=False)
+test_user_genomes.to_csv('datasets/collection_genomes_127765.csv', index=False)
+
+    
 
 
 
