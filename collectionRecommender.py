@@ -281,32 +281,7 @@ class collectionRecommender(object):
         else:
             print('User {} not in ratings.'.format(user))
             return None
-            
-    def _online_update(self, new_ratings):
-        """
-        This method should only be called by addRating or removeRating.
-        If the profiles of users or movies in new_ratings are still below
-        update_threshold, then this function will call updateUser or updateMovie
-        as appropriate. Will also update the updated_users and updated_movies
-        lists to keep track of who has been modified since last fit.
-        
-        :param new_ratings: list of tuples of new ratings which have already
-            been added to ratings DataFrame.
-        
-        :returns: None
-        """
-        users_to_update = list(set([nr[0] for nr in new_ratings]))
-        movies_to_update = list(set([nr[1] for nr in new_ratings]))
-        
-        for user in users_to_update:
-            profile_size = self.ratings.filter(self.ratings.userId==user).count()
-            if profile_size <= self.update_threshold:
-                self._updateUser(user, profile_size)
-        for movie in movies_to_update:
-            profile_size = self.ratings.filter(self.ratings.movieId==movie).count()
-            if profile_size <= self.update_threshold:
-                self._updateMovie(movie)
-        
+                
     def addRatings(self, new_ratings):
         """
         Adds new ratings to the ratings DataFrame. Calls _onlineUpdate to
@@ -389,6 +364,31 @@ class collectionRecommender(object):
                                        .alias('movieId'),
                                    self.ratings.new_rating\
                                        .alias('rating'))
+    
+    def _online_update(self, new_ratings):
+        """
+        This method should only be called by addRating or removeRating.
+        If the profiles of users or movies in new_ratings are still below
+        update_threshold, then this function will call updateUser or updateMovie
+        as appropriate. Will also update the updated_users and updated_movies
+        lists to keep track of who has been modified since last fit.
+        
+        :param new_ratings: list of tuples of new ratings which have already
+            been added to ratings DataFrame.
+        
+        :returns: None
+        """
+        users_to_update = list(set([nr[0] for nr in new_ratings]))
+        movies_to_update = list(set([nr[1] for nr in new_ratings]))
+        
+        for user in users_to_update:
+            profile_size = self.ratings.filter(self.ratings.userId==user).count()
+            if profile_size <= self.update_threshold:
+                self._updateUser(user, profile_size)
+        for movie in movies_to_update:
+            profile_size = self.ratings.filter(self.ratings.movieId==movie).count()
+            if profile_size <= self.update_threshold:
+                self._updateMovie(movie)
         
     def _updateUser(self,user, profile_size):
         """
