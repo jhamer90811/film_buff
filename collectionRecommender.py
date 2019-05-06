@@ -809,6 +809,30 @@ class collectionRecommender(object):
     
     def save(self, save_dir, refit = False, save_ratings = False,
              save_preds = False):
+        """
+        Saves a collectionRecommender object to a user-specified directory. Any
+        Spark DataFrames are serialized as JSON objects, and all other model
+        attributes are collected into a Python dict and serialized as a JSON
+        called metadata. The data is saved in the directory with the following
+        names:
+        
+        collectionRecommender.userFactors --> userFactors
+        collectionRecommender.itemFactors --> itemFactors
+        collectionRecommender.ratings --> ratings
+        collectionRecommender.predictions --> predictions
+        All other attributes --> metadata
+        
+        :param save_dir: A string specifying the name of the directory to which 
+            model will be saved.
+        :param refit: A boolean specifying whether or not to refit the model
+            on internal ratings DataFrame prior to saving.
+        :param save_ratings: A boolean specifying whether or not to save the
+            internal ratings DataFrame. WARNING: if this option is not set to false
+            and the ratings data is not saved elsewhere, then future refitting of
+            the model will be impossible.
+        :param save_preds: A boolean specifying whether or not to save the
+            predictions DataFrame.
+        """
         if not os.path.exists(save_dir):
             print('Specified directory does not exist.')
             return None
@@ -843,6 +867,15 @@ class collectionRecommender(object):
         json.dump(metadata, open(os.path.join(save_dir, 'metadata'), 'w'))
         
     def load(self, load_dir):
+        """
+        Loads collectionRecommender model from directory specified by load_dir.
+        Note that the contents of load_dir must have the names and formats
+        specified by the collectionRecommender.save method (see that
+        documentation for further information).
+        
+        :param load_dir: A string specifying the name of directory from which 
+            to load the collectionRecommender object
+        """
         if not os.path.exists(load_dir):
             print('Specified load directory does not exist.')
             return None
@@ -907,6 +940,29 @@ class collectionRecommender(object):
  
 def recommender_crossValidate(ratings, param_grids, num_folds=3, seed=9,
                               max_training_samples = 20):
+    """
+    This method performs grid-search cross-validation for hyperparameter
+    tuning. Any hyperparameters to be passed to Spark's ALS model may be
+    tuned. CV splits are done on users, so that evaluation is done on users
+    without any pre-exising latent factors. This evaluation method is consistent
+    with the collectionRecommender's built-in evaluation methods.
+    
+    :param ratings: Spark DataFrame of schema userId/movieId/rating to be split
+    and used for CV.
+    :param param_grids: List of Python dicts. The keys of each dict should be
+    names of ALS model hyperparameters, and the values should be lists of 
+    appropriate values.
+    :param num_folds: An integer specifying the number of folds for CV.
+    :param seed: Currently not implemented. In future will be used to set the
+    seed for cross validation shuffling.
+    :param max_training_samples: An integer specifying the maximal number of
+    training samples to use for evaluation.
+    
+    :returns: List of Pandas DataFrames. Each DataFrame corresponds to a 
+    parameter dict passed via param_grids. The rows of each DataFrame correspond
+    to a specific combination of parameters and CV folds. The sequence of RMSE_j
+    is reported for each parameter/fold combination.
+    """
     users = [u[0] for u in ratings.select('userId').distinct().collect()]
     users = list(int(x) for x in np.random.permutation(users))
     n_users = len(users)
