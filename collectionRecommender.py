@@ -22,12 +22,7 @@ Quentin Tarantino", or "language=French".
 import numpy as np
 import pandas as pd
 
-from pyspark import SparkContext
-from pyspark.sql import SparkSession
-spark_home = '/usr/local/spark'
-sc = SparkContext('local', 'film_buff', spark_home)
-spark = SparkSession(sc)
-
+from pyspark import StorageLevel
 from pyspark.ml.recommendation import ALS
 from pyspark.ml.tuning import ParamGridBuilder
 from pyspark.sql.types import StructType,StructField,ArrayType,\
@@ -35,8 +30,10 @@ from pyspark.sql.types import StructType,StructField,ArrayType,\
 import pyspark.sql.functions as sqlfun
 from pyspark.sql.functions import col
 
-from scipy.optimize import nnls
+from recommender_functions import *
 
+import time, os, json
+from pathlib import Path
 
 
 
@@ -142,8 +139,9 @@ class collectionRecommender(object):
         model = self.als.fit(self.ratings)
         self.userFactors = model.userFactors
         self.itemFactors = model.itemFactors
+        self.ratings = self.ratings.withColumn('full_train', sqlfun.lit(True))
         
-    def predict(self, user, keep=1000):
+    def _predict(self, user):
         """
         Will make predictions for user on all unrated movies. Updates internal
         predictions attribute.
@@ -151,111 +149,44 @@ class collectionRecommender(object):
         :param user: The id of the user to update. Throws error if the model
             has not yet been trained on this user.
         :type user: int
-        :param keep: The number of predictions to retain in the predictions
-            attribute. If None, will keep all.
-        :type keep: int
         
         :returns: None
         """
-        if (not self.userFactors) or (not self.itemFactors):
-            print('No model trained!')
-            return None
-        uf = self.userFactors\
-                 .filter(self.userFactors.id==user)\
-                 .collect()
-        if uf:
-            uf=uf[0]
-        else:
-            print('Model has not been trained on user {}.'.format(user))
-            return None
-        self.predicted_users = list(set(self.predicted_users+[user]))
-        already_rated = self.ratings.filter(self.ratings.userId==user)\
-                                    .select('movieId')\
-                                    .collect()
-        already_rated = sorted([row[0] for row in already_rated])
-        to_predict = self.itemFactors\
-                         .filter(~self.itemFactors.id.isin(already_rated))\
-                         .toLocalIterator()
-        del already_rated
-        # _get_predictions returns a spark DF
-        self._update_predictions(self._get_predictions(uf, to_predict, 
-                                                       keep=keep))
+        user_factors = self.userFactors.filter(col('id')==user)
+        user_factors = user_factors.withColumnRenamed('features',
+                                                      'userFactors')\
+                                   .withColumnRenamed('id',
+                                                      'userId')
         
-    def _get_predictions(self, uf, to_predict, keep=None):
-        """
-        Computes predicted ratings given single user factors and item factors.
+        to_predict = self.ratings.filter(col('userId')==user)\
+                                 .select('movieId')
+        to_predict = to_predict.join(self.itemFactors,
+                                     to_predict.movieId==self.itemFactors.id,
+                                     how='outer')\
+                               .filter(to_predict.movieId.isNull())\
+                               .select(col('id').alias('movieId'),
+                                       col('features').alias('itemFactors'))
+        to_predict = to_predict.crossJoin(user_factors)\
+                               .select('userId', 'movieId',
+                                       sqlfun.arrays_zip('userFactors', 
+                                                         'itemFactors')\
+                                       .alias('paired_factors'))
+        to_predict = to_predict.withColumn('predictedRating_new',
+                                           dot_product('paired_factors'))
+        to_predict = to_predict.select(col('userId').alias('userId_new'),
+                                       col('movieId').alias('movieId_new'),
+                                       'predictedRating_new')
         
-        :param uf: Single user's factors, formatted as a Spark Row object
-            with attributes 'id' and 'features'. Extracted from internal
-            userFactors DataFrame.
-        :param to_predict: An iterator produced by filtering the internal
-            itemFactors DataFrame for movies not yet rated by the user given
-            in uf.
+        self.predicted_users = list(set(self.predicted_users + [user]))
+        self.predictions = update_predictions(self.predictions, to_predict)
         
-        :returns: a Spark DataFrame with schema: ('userId_new', int),
-            ('movieId_new', int), ('predictedRating_new', float).
-        """
-        preds = []
-        userId = uf[0]
-        userFactors = np.array(uf[1])
-        for movie in to_predict:
-            movieId = movie[0]
-            movieFactors = np.array(movie[1])
-            preds.append((userId,
-                          movieId,
-                          float(userFactors.dot(movieFactors))))
-        
-        if keep:
-            preds = sorted(preds, key=lambda x: x[2], reverse=True)[:keep]
-        
-        schema = StructType([StructField('userId_new', IntegerType(),True),
-                             StructField('movieId_new', IntegerType(), True),
-                             StructField('predictedRating_new', FloatType(),True)])
-        return(spark.createDataFrame(preds, schema=schema))
-        
-    def _update_predictions(self, new_predictions):
-        """
-        Takes Spark DataFrame of new_predictions and updates the internal
-        Spark DataFrame of predictions. Will override existing predictions,
-        if they exist.
-        
-        :param new_predictions: a Spark DataFrame with schema: ('userId_new', int),
-            ('movieId_new', int), ('predictedRating_new', float).
-        
-        :returns: None
-        """
-        join_condition = [self.predictions.userId==new_predictions.userId_new,
-                          self.predictions.movieId==new_predictions.movieId_new]
-        self.predictions = self.predictions.join(new_predictions,
-                                                 join_condition,
-                                                 'outer')
-        
-        self.predictions = self.predictions\
-                               .withColumn('predictedRating_new',
-                                           sqlfun.when(self.predictions\
-                                                           .predictedRating_new\
-                                                           .isNotNull(),
-                                                       self.predictions\
-                                                           .predictedRating_new)\
-                                                   .otherwise(self.predictions\
-                                                                  .predictedRating))
-        self.predictions = self.predictions\
-                               .select(sqlfun.coalesce(self.predictions.userId,
-                                                       self.predictions.userId_new)\
-                                           .alias('userId'),
-                                       sqlfun.coalesce(self.predictions.movieId,
-                                                       self.predictions.movieId_new)\
-                                           .alias('movieId'),
-                                       self.predictions.predictedRating_new\
-                                           .alias('predictedRating'))
-                                       
     def recommend(self, user, num_recs=20):
         """
         Returns top recommendations for specified user. If user is not found
         in predictions DataFrame, then predict is called to generate predictions.
         
         :param user: userId of user for whom to make recommendations
-        :type user: int
+            :type user: int
         :param num_recs: The number of recommendations to return. Cannot
             exceed total number of predictions made for user in the predictions
             DataFrame. If more recommendations are desired, recall predict
@@ -268,14 +199,14 @@ class collectionRecommender(object):
         if user in self.predicted_users:
             recommendations = self.predictions\
                                   .filter(self.predictions.userId==user)\
-                                  .sort(self.predictions.predictedRating.desc())\
+                                  .sort(col('predictedRating').desc())\
                                   .take(num_recs)
             return recommendations
         elif user in self.train_users+self.updated_users:
-            self.predict(user)
+            self._predict(user)
             recommendations = self.predictions\
                                   .filter(self.predictions.userId==user)\
-                                  .sort(self.predictions.predictedRating.desc())\
+                                  .sort(col('predictedRating').desc())\
                                   .take(num_recs)
             return recommendations
         else:
@@ -297,7 +228,7 @@ class collectionRecommender(object):
                                          StructField('new_rating', FloatType(), True)])
         new_ratings_df = spark.createDataFrame(new_ratings, 
                                                schema=new_ratings_schema)
-        self._update_ratings(new_ratings_df)
+        self.ratings = update_ratings(self.ratings, new_ratings_df)
         self._online_update(new_ratings)
     
     def addToCollection(self, new_movies):
@@ -330,41 +261,6 @@ class collectionRecommender(object):
             self.ratings=self.ratings.filter(~cond)
         self._online_update(old_ratings)
     
-    def _update_ratings(self, new_ratings):
-        """
-        Updates internal ratings DataFrame with new_ratings.
-        
-        :param new_ratings: Spark DataFrame with schema 
-            StructType([StructField('new_userId', IntegerType(),True),
-                        StructField('new_movieId', IntegerType(), True),
-                        StructField('new_rating', FloatType(), True)])
-        :returns: None
-        """
-        join_condition = [self.ratings.userId==new_ratings.new_userId,
-                          self.ratings.movieId==new_ratings.new_movieId]
-        self.ratings = self.ratings.join(new_ratings,
-                                         join_condition,
-                                         'outer')
-        
-        self.ratings = self.ratings\
-                           .withColumn('new_rating',
-                                       sqlfun.when(self.ratings\
-                                                       .new_rating\
-                                                       .isNotNull(),
-                                                   self.ratings\
-                                                       .new_rating)\
-                                              .otherwise(self.ratings\
-                                                             .rating))
-        self.ratings = self.ratings\
-                           .select(sqlfun.coalesce(self.ratings.userId,
-                                                   self.ratings.new_userId)\
-                                         .alias('userId'),
-                                   sqlfun.coalesce(self.ratings.movieId,
-                                                   self.ratings.new_movieId)\
-                                       .alias('movieId'),
-                                   self.ratings.new_rating\
-                                       .alias('rating'))
-    
     def _online_update(self, new_ratings):
         """
         This method should only be called by addRating or removeRating.
@@ -378,178 +274,51 @@ class collectionRecommender(object):
         
         :returns: None
         """
-        users_to_update = list(set([nr[0] for nr in new_ratings]))
-        movies_to_update = list(set([nr[1] for nr in new_ratings]))
+        user_list = list(set([nr[0] for nr in new_ratings]))
+        item_list = list(set([nr[1] for nr in new_ratings]))
         
-        for user in users_to_update:
-            profile_size = self.ratings.filter(self.ratings.userId==user).count()
-            if profile_size <= self.update_threshold:
-                self._updateUser(user, profile_size)
-        for movie in movies_to_update:
-            profile_size = self.ratings.filter(self.ratings.movieId==movie).count()
-            if profile_size <= self.update_threshold:
-                self._updateMovie(movie)
+        users_to_update = self.ratings.filter(col('userId').isin(user_list))
+        items_to_update = self.ratings.filter(col('movieId').isin(item_list))
         
-    def _updateUser(self,user, profile_size):
+        user_profiles = users_to_update.groupby('userId').agg({'full_train':'count'})
+        user_profiles = user_profiles.select(col('userId').alias('userId2'),
+                                             col('count(full_train)').alias('user_profile'))
+        
+        item_profiles = items_to_update.groupby('movieId').agg({'full_train':'count'})
+        item_profiles = item_profiles.select(col('movieId').alias('movieId2'),
+                                             col('count(full_train)').alias('item_profile'))
+        
+        users_to_update = users_to_update.join(user_profiles,
+                                               users_to_update.userId==user_profiles.userId2,
+                                               how='left')\
+                                         .join(item_profiles,
+                                               users_to_update.movieId==item_profiles.movieId2,
+                                               how='left')
+        items_to_update = items_to_update.join(item_profiles,
+                                               items_to_update.movieId==item_profiles.movieId2,
+                                               how='left')\
+                                         .join(user_profiles,
+                                               items_to_update.userId==user_profiles.userId2,
+                                               how='left')
+        users_to_update = users_to_update.filter(col('user_profile')<=self.update_threshold)
+        users_to_update = users_to_update.select('userId', 'movieId', 'rating')
+        items_to_update = items_to_update.filter(col('item_profile')<=self.update_threshold)
+        items_to_update = items_to_update.select('userId', 'movieId', 'rating')
+        
+        self._updateUsers(users_to_update)
+        self._updateItems(items_to_update)
+        
+    def _updateUsers(self, users_to_update):
         """
         Performs regularized nonnegative least-squares optimization to update
-        latent factors for user. If there are movies in the user's profile
+        latent factors for users. If there are movies in the users' profile
         which have only been rated by the user, then a partial ALS will be
         called in order to generate latent factors for these movies.
         
-        :param user: userId of user in ratings DataFrame
-        :type user: int
-        
-        :param profile_size: the total number of ratings from the user
-        :type profile_size: int
-        
-        :returns: None
-        """
-        rank = self.als.getRank()
-        regParam = self.als.getRegParam()
-        # maxIter = self.als.getMaxIter()
-        
-        user_ratings = self.ratings.filter(self.ratings.userId==user)
-        user_ratings = user_ratings.join(self.itemFactors,
-                                         user_ratings.movieId==self.itemFactors.id,
-                                         how='inner')
-        if profile_size > user_ratings.count():
-            self._partial_als(user)
-            return None
-        b = user_ratings.select('rating').collect()
-        b = np.array([r[0] for r in b])
-        b = np.concatenate((b, np.zeros(rank)))
-        
-        A = user_ratings.select('features').collect()
-        A = np.array([r[0] for r in A])
-        A = np.concatenate((A, np.sqrt(regParam)*np.eye(rank)))
-        
-        w = nnls(A, b)[0]
-        w = [float(f) for f in w]
-        
-        new_userFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        new_userFactors = spark.createDataFrame([(user, w)], 
-                                                schema=new_userFactor_schema)
-        self._update_userFactors(new_userFactors)
-        self.updated_users = list(set(self.updated_users+[user]))
-    
-    def _update_userFactors(self, new_factors):
-        """
-        Helper function for updating the userFactors matrix.
-        
-        :param new_factors: Spark DataFrame with schema
-            new_userFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        """
-        join_condition = self.userFactors.id==new_factors.new_id
-        
-        self.userFactors = self.userFactors.join(new_factors,
-                                                 on=join_condition,
-                                                 how='outer')
-        self.userFactors = self.userFactors\
-                               .withColumn('new_features',
-                                           sqlfun.when(self.userFactors\
-                                                           .new_features\
-                                                           .isNotNull(),
-                                                       self.userFactors\
-                                                           .new_features)\
-                                                  .otherwise(self.userFactors\
-                                                                 .features))
-        self.userFactors = self.userFactors\
-                               .select(sqlfun.coalesce(self.userFactors.id,
-                                                       self.userFactors.new_id)\
-                                             .alias('id'),
-                                       self.userFactors.new_features.alias('features'))
-    def _updateMovie(self, movie):
-        """
-        Performs regularized nonnegative least-squares optimization to update
-        latent factors for movie.
-        
-        :param movie: movieId of movie in ratings DataFrame
-        :type movie: int
-        
-        :returns: None
-        """
-        rank = self.als.getRank()
-        regParam = self.als.getRegParam()
-        # maxIter = self.als.getMaxIter()
-        
-        movie_ratings = self.ratings.filter(self.ratings.movieId==movie)
-        movie_ratings = movie_ratings.join(self.userFactors,
-                                         movie_ratings.userId==self.userFactors.id,
-                                         how='inner')
-        
-        b = movie_ratings.select('rating').collect()
-        b = np.array([r[0] for r in b])
-        b = np.concatenate((b, np.zeros(rank)))
-        
-        A = movie_ratings.select('features').collect()
-        A = np.array([r[0] for r in A])
-        A = np.concatenate((A, np.sqrt(regParam)*np.eye(rank)))
-        
-        h = nnls(A, b)[0]
-        h = [float(f) for f in h]
-        
-        new_itemFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        new_itemFactors = spark.createDataFrame([(movie, h)], 
-                                                schema=new_itemFactor_schema)
-        self._update_itemFactors(new_itemFactors)
-        self.updated_movies = list(set(self.updated_movies+[movie]))
-        
-    def _update_itemFactors(self, new_factors):
-        """
-        Helper function for updating the itemFactors matrix.
-        
-        :param new_factors: Spark DataFrame with schema
-            new_movieFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        """
-        join_condition = self.itemFactors.id==new_factors.new_id
-        
-        self.itemFactors = self.itemFactors.join(new_factors,
-                                                 on=join_condition,
-                                                 how='outer')
-        self.itemFactors = self.itemFactors\
-                               .withColumn('new_features',
-                                           sqlfun.when(self.itemFactors\
-                                                           .new_features\
-                                                           .isNotNull(),
-                                                       self.itemFactors.\
-                                                           new_features)\
-                                                  .otherwise(self.itemFactors\
-                                                                 .features))
-        self.itemFactors = self.itemFactors\
-                               .select(sqlfun.coalesce(self.itemFactors.id,
-                                                       self.itemFactors.new_id)\
-                                             .alias('id'),
-                                       self.itemFactors.new_features.alias('features'))
-                                           
-    def _partial_als(self, user):
-        """
-        Performs ALS on the subset of ratings with userId user. Latent factors
-        for films which have been reviewed by other users will not be updated,
-        but latent factors for films only reviewed by user will be updated.
-        
-        :param user: userId of user on whom to perform partial ALS.
-        :type user: int
+        :param users_to_update: Spark DataFrame with schema
+            StructType([StructField('userId', IntegerType(),True),
+                        StructField('movieId', IntegerType(), True),
+                        StructField('rating', FloatType(), True)])
         
         :returns: None
         """
@@ -557,68 +326,103 @@ class collectionRecommender(object):
         maxIter = self.als.getMaxIter()
         regParam = self.als.getRegParam()
         
-        user_profile = self.ratings.filter(self.ratings.userId==user)
-        user_profile = user_profile.join(self.itemFactors,
-                                         user_profile.movieId==self.itemFactors.id,
-                                         'left')
-        items_to_update = user_profile.filter(col('features').isNull())\
-                                      .select('movieId')\
-                                      .collect()
-        items_to_update = [r[0] for r in items_to_update]
+        users_to_update = users_to_update.join(self.itemFactors,
+                                               users_to_update.movieId==self.itemFactors.id,
+                                               'left')
+        users_to_update = users_to_update.select('userId',
+                                                 sqlfun.struct('movieId', 'features')\
+                                                       .alias('itemFactors'),
+                                                 'rating')
+        users_to_update = users_to_update.groupby('userId')\
+                                         .agg(sqlfun.collect_list('itemFactors')\
+                                                  .alias('itemFactors'),
+                                              sqlfun.collect_list('rating')\
+                                                  .alias('rating'))
         
-        # initialize missing item features
-        user_profile = user_profile.withColumn('features',
-                                               sqlfun.when(col('features').isNull(),
-                                                           sqlfun.array_repeat(\
-                                                               sqlfun.sqrt(col('rating'))\
-                                                               +0.1*sqlfun.randn(),
-                                                               rank))\
-                                                     .otherwise(col('features')))
+        users_to_update = users_to_update.withColumn('new_latent_factors',
+                                                     new_lf('itemFactors',
+                                                            'rating',
+                                                            sqlfun.lit(rank),
+                                                            sqlfun.lit(maxIter),
+                                                            sqlfun.lit(regParam)))
+        users_to_update = users_to_update.withColumn('new_userFactors',
+                                                     extract_first('new_latent_factors'))
+        users_to_update = users_to_update.withColumn('new_itemFactors',
+                                                     extract_second('new_latent_factors'))
         
-        factors_ratings = user_profile.select('movieId', 'features', 'rating')\
-                                      .toPandas()
+        items_to_update = users_to_update.select('new_itemFactors')\
+                                         .filter(col('new_itemFactors').isNotNull())
         
-        # begin ALS
-        for j in range(maxIter):
-            H = np.array([features for features in factors_ratings.features.values])
-            H = np.concatenate((H, np.sqrt(regParam)*np.eye(rank)))
-            
-            b = factors_ratings.rating.values
-            b = np.concatenate((b, np.zeros(rank)))
-            
-            w = nnls(H, b)[0] # update latent user factors
-            
-            W = np.array([w])
-            W = np.concatenate((W, np.sqrt(regParam)*np.eye(rank)))
-            
-            for m in items_to_update:
-                b = factors_ratings[factors_ratings.movieId==m].rating.values
-                b = np.concatenate((b, np.zeros(rank)))
-                h = nnls(W, b)[0]
-                h = [float(f) for f in h]
-                idx = factors_ratings[factors_ratings.movieId==m].index[0]
-                factors_ratings.features[idx] = h
+        users_to_update = users_to_update.select(col('userId').alias('new_id'), 
+                                                 col('new_userFactors').alias('new_features'))
         
-        # Update internal latent factors
-        new_latentFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        new_userFactors = [(user,[float(f) for f in w])]
-        new_userFactors = spark.createDataFrame(new_userFactors, 
-                                                schema=new_latentFactor_schema)
-        self._update_userFactors(new_userFactors)
+        items_to_update = items_to_update.select(sqlfun.explode('new_itemFactors')\
+                                                       .alias('new_itemFactors'))
+        items_to_update = items_to_update.select(extract_id('new_itemFactors')\
+                                                         .alias('new_id'),
+                                                 extract_features('new_itemFactors')\
+                                                         .alias('new_features'))
+        items_to_update = items_to_update.groupby('new_id')\
+                                         .agg(sqlfun.collect_list('new_features')\
+                                                    .alias('new_features_list'))
+        items_to_update = items_to_update.select('new_id',
+                                                 get_avg('new_features_list')\
+                                                     .alias('new_features'))
         
-        self.updated_users = list(set(self.updated_users + [user]))
-        new_itemFactors = factors_ratings[['movieId', 'features']]
-        new_itemFactors = [tuple(row) for _,row in new_itemFactors.iterrows()]
-        new_itemFactors = [(int(mid), list(features)) for mid,features in new_itemFactors]
-        new_itemFactors = spark.createDataFrame(new_itemFactors, 
-                                                schema=new_latentFactor_schema)
-        self._update_itemFactors(new_itemFactors)
-        self.updated_movies = list(set(self.updated_movies + items_to_update))
+        self.userFactors = update_latentFactors(self.userFactors, users_to_update)
+        self.itemFactors = update_latentFactors(self.itemFactors, items_to_update)
+        
+        updated_users = [x[0] for x in users_to_update.select('new_id').collect()]
+        updated_items = [x[0] for x in items_to_update.select('new_id').collect()]
+        
+        self.updated_users = list(set(self.updated_users + updated_users))
+        self.updated_movies = list(set(self.updated_movies + updated_items))
+    
+    def _updateItems(self, items_to_update):
+        """
+        Performs regularized nonnegative least-squares optimization to update
+        latent factors for multiple items.
+        
+        :param items_to_update: Spark DataFrame with schema 
+            StructType([StructField('userId', IntegerType(),True),
+                        StructField('movieId', IntegerType(), True),
+                        StructField('rating', FloatType(), True)])
+        
+        :returns: None
+        """
+        rank = self.als.getRank()
+        maxIter = self.als.getMaxIter()
+        regParam = self.als.getRegParam()
+        
+        items_to_update = items_to_update.join(self.userFactors,
+                                               items_to_update.userId==self.userFactors.id,
+                                               'left')
+        items_to_update = items_to_update.select('movieId',
+                                                 sqlfun.struct('userId', 'features')\
+                                                       .alias('userFactors'),
+                                                 'rating')
+        items_to_update = items_to_update.groupby('movieId')\
+                                         .agg(sqlfun.collect_list('userFactors')\
+                                                  .alias('userFactors'),
+                                              sqlfun.collect_list('rating')\
+                                                  .alias('rating'))
+        
+        items_to_update = items_to_update.withColumn('new_latent_factors',
+                                                     new_lf('userFactors',
+                                                            'rating',
+                                                            sqlfun.lit(rank),
+                                                            sqlfun.lit(maxIter),
+                                                            sqlfun.lit(regParam)))
+        items_to_update = items_to_update.withColumn('new_itemFactors',
+                                                     extract_first('new_latent_factors'))
+        
+        items_to_update = items_to_update.select(col('movieId').alias('new_id'), 
+                                                 col('new_itemFactors').alias('new_features'))
+        self.itemFactors = update_latentFactors(self.itemFactors, items_to_update)
+        
+        updated_items = [x[0] for x in items_to_update.select('new_id').collect()]
+        
+        self.updated_movies = list(set(self.updated_movies + updated_items))
         
     def evaluate_withRatings(self, test, itemFactors, alpha=0.9):
         """
@@ -667,6 +471,8 @@ class collectionRecommender(object):
         :returns: A tuple of the form ([list of RMSE_j], elbow index, RMSE_adj)
         """
         # First set up training and validation sets
+#        print('Initial number of persistent RDDs: {}'\
+#              .format(len(spark.sparkContext._jsc.getPersistentRDDs())))
         M = self.update_threshold
         
         test = test.withColumn('movie_rating', sqlfun.struct('userId', 
@@ -675,82 +481,161 @@ class collectionRecommender(object):
         test = test.select('userId', 'movie_rating')
         test = test.groupby('userId').agg(sqlfun.collect_list('movie_rating')\
                                                 .alias('movie_rating_list'))
+        all_users = test.select('userId')
         test = test.withColumn('movie_rating_list', 
                                sqlfun.shuffle(col('movie_rating_list')))
         test = test.withColumn('profile_size', sqlfun.size('movie_rating_list'))
+        
+        # Will not evaluate on users half of whose profile is obscure (i.e.
+        # movies on which the model has not been trained).
+        # This step also gaurantees that the validation sets will be at least
+        # 5 items, or 1/8 the total profile, whichever is smaller.
+        test = test.withColumn('obscurity', get_obscurity('movie_rating_list',
+                                                          sqlfun.array([sqlfun.lit(x)\
+                                                                        for x in\
+                                                                        self.train_movies]),
+                                                          sqlfun.lit(M)))
+        test = test.dropna(subset='obscurity').drop('obscurity')
+        obscure_users = all_users.exceptAll(test.select('userId'))
+        
         test = test.withColumn('train_size', sqlfun.when(sqlfun.ceil(col('profile_size')/2)<M,
                                                          sqlfun.ceil(col('profile_size')/2))\
                                                     .otherwise(M))
+        test = test.withColumn('validation_set',
+                               extract_slice('movie_rating_list',
+                                             'train_size',
+                                             sqlfun.lit(None)))
+        test = test.withColumn('validation_set',
+                               get_val_set('validation_set',
+                                            sqlfun.array([sqlfun.lit(x)\
+                                                          for x in\
+                                                          self.train_movies])))
         test = test.withColumn('validation_size', 
-                               col('profile_size')-col('train_size'))
-        # Need functions to extract movie/rating tuples from test.
-        @sqlfun.udf(returnType=StructType([StructField('userId', IntegerType()),
-                                           StructField('movieId', IntegerType()),
-                                           StructField('rating', FloatType())]))
-        def extract_one(a, j):
-            # remember to pass j with sqlfun.lit(j)
-            return a[j]
-        @sqlfun.udf(returnType=ArrayType(StructType([StructField('userId', 
-                                                                 IntegerType()),
-                                           StructField('movieId', IntegerType()),
-                                           StructField('rating', FloatType())])))
-        def extract_slice(a, start, stop):
-            return a[start:stop]
+                               sqlfun.size('validation_set'))\
+                   .cache().localCheckpoint()
+        test.count()
+        
+        # Extract and cache DFs for training and validation itemFactors
+        
+        val_items = test.select(sqlfun.explode('validation_set').alias('val_sample'))
+        val_items = val_items.select(col('val_sample')\
+                                     .getField('movieId').alias('movieId'))\
+                             .distinct()
+        val_itemFactors = val_items.join(itemFactors,
+                                         val_items.movieId==itemFactors.id,
+                                         how='left')\
+                                   .select('id', 'features')\
+                                   .cache().localCheckpoint()
+        val_itemFactors.count()
+#        print('Caching validation itemFactors...')
+#        print('Number of validation items: {}'.format(val_itemFactors.count()))
+        
+        train_items = test.select(extract_slice('movie_rating_list',
+                                                sqlfun.lit(0),
+                                                'train_size')\
+                                  .alias('train_set'))
+        train_items = train_items.select(sqlfun.explode('train_set')\
+                                         .alias('train_sample'))
+        train_items = train_items.select(col('train_sample')\
+                                         .getField('movieId')\
+                                         .alias('movieId'))
+        train_itemFactors = train_items.join(itemFactors,
+                                             train_items.movieId==itemFactors.id,
+                                             how='inner')\
+                                       .select('id', 'features')\
+                                       .cache().localCheckpoint()
+        train_itemFactors.count()
+#        print('Caching training itemFactors...')
+#        print('Number of training items: {}'.format(train_itemFactors.count()))
         
         latentFactor_schema = StructType([StructField('id', IntegerType()),
                                           StructField('features', 
                                                         ArrayType(FloatType()))])
         userFactors = spark.createDataFrame([], schema=latentFactor_schema)
         
-        ratings_schema = StructType([StructField('userId', IntegerType()),
-                                     StructField('movieId', IntegerType()),
-                                     StructField('rating', FloatType())])
-        ratings = spark.createDataFrame([], schema=ratings_schema)
+        scores = test.select('userId', 'validation_size')
         
         rmse_list = []
         
+#        print('***********************')
+#        print('BEGINNING EVAL ITERATIONS')
+#        print('***********************')
         for j in range(M):
+            
+            iteration_time = time.time()
+#            print('Validation Iteration {}/{}'.format(j+1, M))
             new_ratings = test.filter(j<col('train_size'))
-            if new_ratings.count()==0:
+            if not new_ratings.take(1):
+                M = j+1
+                print('No training samples left, stopping early at iteration {}'\
+                      .format(M))
                 break
-            validation_sets = new_ratings.select('userId',
-                                                 extract_slice('movie_rating_list',
-                                                               'train_size',
-                                                               sqlfun.lit(None))\
-                                                  .alias('validation_set'),
-                                                 'validation_size')
-            new_ratings = new_ratings.select(extract_one('movie_rating_list',
-                                                         sqlfun.lit(j))\
-                                             .alias('train_set'))
-            new_ratings = [tuple(r[0]) for r in new_ratings.toLocalIterator()]
-            ratings, userFactors, itemFactors =\
-                                        self._eval_addRatings(ratings,
-                                                              new_ratings,
-                                                              userFactors,
-                                                              itemFactors)
-            total_val_size = 0
-            sse_list = []
-            for val_set in validation_sets.toLocalIterator():
-                user = val_set[0]
-                val_items = [r[1] for r in val_set[1]]
-                val_ratings = [r[2] for r in val_set[1]]
-                val_size = val_set[2]
-                total_val_size+=val_size
-                
-                preds = self._eval_predict(user, val_items,
-                                               userFactors, itemFactors)
-                sse = np.sum((np.array(preds)-np.array(val_ratings))**2)
-                sse_list.append(sse)
-            sse_list = np.array(sse_list)
-            rmse_list.append(np.sqrt(sse_list.sum()/total_val_size))
-            print('Iteration {} done. RMSE is {}'.format(j, rmse_list[-1]))
+            validation_users = new_ratings.select('validation_set')
+            
+            train_ratings = new_ratings.select(extract_slice('movie_rating_list',
+                                                             sqlfun.lit(0),
+                                                             sqlfun.lit(j+1))\
+                                                .alias('train_set'))
+            train_ratings = train_ratings.select(sqlfun.explode('train_set')\
+                                                 .alias('train_sample'))
+            train_ratings = train_ratings.select(col('train_sample')\
+                                                 .getField('userId')\
+                                                 .alias('userId'),
+                                                 col('train_sample')\
+                                                 .getField('movieId')\
+                                                 .alias('movieId'),
+                                                 col('train_sample')\
+                                                 .getField('rating')\
+                                                 .alias('rating'))
+            
+            # Persistence of previous DataFrames survives the name change
+            # This allows us to unpersist immediately after we're done with them
+            old_userFactors = userFactors
+            old_train_itemFactors = train_itemFactors
+            
+            userFactors, train_itemFactors =self._eval_updateUsers(train_ratings,
+                                                             old_userFactors,
+                                                             old_train_itemFactors)
+            new_scores = self._eval_get_scores(scores, validation_users,
+                                               userFactors, val_itemFactors)
+            
+            
+            rmse_time = time.time()
+            rmse_j = new_scores.filter(col('sse').isNotNull())\
+                           .select(get_sqrt(sqlfun.sum('sse')/\
+                                            sqlfun.sum('validation_size')))\
+                           .collect()[0][0]
+#            print('RMSE_{} = {}; update time: {}'\
+#                  .format(j+1, round(rmse_j,2), round(time.time()-rmse_time,2)))
+            rmse_list.append(rmse_j)
+            
+#            print('Total time spent on iteration {}: {}'\
+#                  .format(j+1, round(time.time()-iteration_time,2)))
+#            print('*******************************\n')
+            
         
         elbow_index = self._eval_get_elbow_index(rmse_list, alpha)
         rmse_adj = self._eval_get_rmse_adj(rmse_list, elbow_index)
         
+#        print("The following users' profiles were too obscure for eval:")
+#        obscure_users.show(truncate=100)
+        
+#        print('Unpersisting userFactors...')
+        userFactors.unpersist()
+#        print('Unpersisting training itemFactors...')
+        train_itemFactors.unpersist()
+#        print('Unpersisting validation itemFactors...')
+        val_itemFactors.unpersist()
+#        print('Unpersisting modified test set...')
+        test.unpersist()
+#        spark.catalogue.clearCache()
+        
+#        print('Final number of persistent RDDs: {}'\
+#              .format(len(spark.sparkContext._jsc.getPersistentRDDs())))
+        
         return rmse_list, elbow_index, rmse_adj
         
-    def eval_withoutRatings(self, test, itemFactors, alpha=0.9):
+    def evaluate_withoutRatings(self, test, itemFactors, alpha=0.9):
         """
         Evaluates on new users who do not supply ratings with their movies.
         The test set is given a 'rating' column consisting of the 
@@ -759,81 +644,8 @@ class collectionRecommender(object):
         """
         test = test.withColumn('rating', sqlfun.lit(self.ownership_conversion))
         return self.eval_withRatings(test, itemFactors, alpha)
-    def _eval_addRatings(self, ratings, new_ratings, userFactors, itemFactors):
-        """
-        Helper function for evaluation. Adds new_ratings to ratings and calls
-        online update to update userFactors and itemFactors.
-        
-        :returns: (updated_ratings, updated_userFactors, updated_itemFactors)
-        """
-        new_ratings_schema = StructType([StructField('new_userId', IntegerType(),True),
-                                         StructField('new_movieId', IntegerType(), True),
-                                         StructField('new_rating', FloatType(), True)])
-        new_ratings_df = spark.createDataFrame(new_ratings, 
-                                               schema=new_ratings_schema)
-        ratings = self._eval_update_ratings(ratings, new_ratings_df)
-        userFactors, itemFactors = self._eval_online_update(ratings, 
-                                                            new_ratings, 
-                                                            userFactors, 
-                                                            itemFactors)
-        return ratings, userFactors, itemFactors
     
-    def _eval_update_ratings(self, ratings, new_ratings):
-        """
-        Helper function for evaluation. Appends new ratings to old ratings
-        DataFrame and returns the updated ratings DataFrame
-        
-        :returns: updated_ratings
-        """
-        join_condition = [ratings.userId==new_ratings.new_userId,
-                          ratings.movieId==new_ratings.new_movieId]
-        ratings = ratings.join(new_ratings,
-                                 join_condition,
-                                 'outer')
-        
-        ratings = ratings\
-                   .withColumn('new_rating',
-                               sqlfun.when(ratings\
-                                               .new_rating\
-                                               .isNotNull(),
-                                           ratings\
-                                               .new_rating)\
-                                      .otherwise(ratings\
-                                                     .rating))
-        ratings = ratings\
-                   .select(sqlfun.coalesce(ratings.userId,
-                                           ratings.new_userId)\
-                                 .alias('userId'),
-                           sqlfun.coalesce(ratings.movieId,
-                                           ratings.new_movieId)\
-                               .alias('movieId'),
-                           ratings.new_rating\
-                               .alias('rating'))
-        return ratings
-    
-    def _eval_online_update(self, ratings, new_ratings, userFactors, itemFactors):
-        """
-        Helper function for evaluation.
-        Updates latent factors of users in new_ratings. If partial_als is
-        required due to new movies, will also initialize and update the latent
-        factors for these movies. Movies already in the ratings DataFrame will
-        not have their latent factors updated.
-        
-        :returns: updated_userFactors, updated_itemFactors
-        """
-        users_to_update = list(set([nr[0] for nr in new_ratings]))
-        
-        for user in users_to_update:
-            profile_size = ratings.filter(ratings.userId==user).count()
-            userFactors, itemFactors = self._eval_updateUser(user,
-                                                             profile_size,
-                                                             ratings, 
-                                                             userFactors, 
-                                                             itemFactors)
-        return userFactors, itemFactors
-    
-    def _eval_updateUser(self, user, profile_size, ratings, userFactors,
-                         itemFactors):
+    def _eval_updateUsers(self, users_to_update, userFactors, itemFactors):
         """
         Helper function for evaluation. Updates the latent factors for user.
         If user has rated movies which have been rated by nobody else, will
@@ -843,191 +655,127 @@ class collectionRecommender(object):
         :returns: updated_userFactors, updated_itemFactors
         """
         rank = self.als.getRank()
-        regParam = self.als.getRegParam()
-        # maxIter = self.als.getMaxIter()
-        
-        user_ratings = ratings.filter(ratings.userId==user)
-        user_ratings = user_ratings.join(itemFactors,
-                                         user_ratings.movieId==itemFactors.id,
-                                         how='inner')
-        if profile_size > user_ratings.count():
-            return self._eval_partial_als(user, ratings, 
-                                          userFactors, itemFactors)
-            
-        b = user_ratings.select('rating').collect()
-        b = np.array([r[0] for r in b])
-        b = np.concatenate((b, np.zeros(rank)))
-        
-        A = user_ratings.select('features').collect()
-        A = np.array([r[0] for r in A])
-        A = np.concatenate((A, np.sqrt(regParam)*np.eye(rank)))
-        
-        w = nnls(A, b)[0]
-        w = [float(f) for f in w]
-        
-        new_userFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        new_userFactors = spark.createDataFrame([(user, w)], 
-                                                schema=new_userFactor_schema)
-        userFactors = self._eval_update_userFactors(userFactors, new_userFactors)
-        return userFactors, itemFactors
-    
-    def _eval_partial_als(self, user, ratings, userFactors, itemFactors):
-        """
-        Helper function for evaluation. Performs ALS to update latent
-        factors for user as well as latent factors for movies in user's profile
-        which have been rated by nobody else.
-        
-        :returns: updated_userFactors, updated_itemFactors
-        """
-        rank = self.als.getRank()
         maxIter = self.als.getMaxIter()
         regParam = self.als.getRegParam()
         
-        user_profile = ratings.filter(ratings.userId==user)
-        user_profile = user_profile.join(itemFactors,
-                                         user_profile.movieId==itemFactors.id,
-                                         'left')
-        items_to_update = user_profile.filter(col('features').isNull())\
-                                      .select('movieId')\
-                                      .collect()
-        items_to_update = [r[0] for r in items_to_update]
+        users_to_update = users_to_update.join(itemFactors,
+                                               users_to_update.movieId==itemFactors.id,
+                                               'left')
+        users_to_update = users_to_update.select('userId',
+                                                 sqlfun.struct('movieId', 'features')\
+                                                       .alias('itemFactors'),
+                                                 'rating')
+        users_to_update = users_to_update.groupby('userId')\
+                                         .agg(sqlfun.collect_list('itemFactors')\
+                                                  .alias('itemFactors'),
+                                              sqlfun.collect_list('rating')\
+                                                  .alias('rating'))
         
-        # initialize missing item features
-        user_profile = user_profile.withColumn('features',
-                                               sqlfun.when(col('features').isNull(),
-                                                           sqlfun.array_repeat(\
-                                                               sqlfun.sqrt(col('rating'))\
-                                                               +0.1*sqlfun.randn(),
-                                                               rank))\
-                                                     .otherwise(col('features')))
+        users_to_update = users_to_update.withColumn('new_latent_factors',
+                                                     new_lf('itemFactors',
+                                                            'rating',
+                                                            sqlfun.lit(rank),
+                                                            sqlfun.lit(maxIter),
+                                                            sqlfun.lit(regParam)))
+        users_to_update = users_to_update.withColumn('new_userFactors',
+                                                     col('new_latent_factors')\
+                                                     .getField('first_features'))
+        users_to_update = users_to_update.withColumn('new_itemFactors',
+                                                     col('new_latent_factors')\
+                                                     .getField('second_features'))
         
-        factors_ratings = user_profile.select('movieId', 'features', 'rating')\
-                                      .toPandas()
+        items_to_update = users_to_update.select('new_itemFactors')\
+                                         .filter(col('new_itemFactors').isNotNull())
         
-        # begin ALS
-        for j in range(maxIter):
-            H = np.array([features for features in factors_ratings.features.values])
-            H = np.concatenate((H, np.sqrt(regParam)*np.eye(rank)))
-            
-            b = factors_ratings.rating.values
-            b = np.concatenate((b, np.zeros(rank)))
-            
-            w = nnls(H, b)[0] # update latent user factors
-            
-            W = np.array([w])
-            W = np.concatenate((W, np.sqrt(regParam)*np.eye(rank)))
-            
-            for m in items_to_update:
-                b = factors_ratings[factors_ratings.movieId==m].rating.values
-                b = np.concatenate((b, np.zeros(rank)))
-                h = nnls(W, b)[0]
-                h = [float(f) for f in h]
-                idx = factors_ratings[factors_ratings.movieId==m].index[0]
-                factors_ratings.features[idx] = h
+        users_to_update = users_to_update.select(col('userId').alias('new_id'), 
+                                                 col('new_userFactors').alias('new_features'))
         
-        # Update internal latent factors
-        new_latentFactor_schema = StructType([StructField('new_id',
-                                                        IntegerType(),
-                                                        True),
-                                            StructField('new_features', 
-                                                        ArrayType(FloatType(),True),
-                                                        True)])
-        new_userFactors = [(user,[float(f) for f in w])]
-        new_userFactors = spark.createDataFrame(new_userFactors, 
-                                                schema=new_latentFactor_schema)
-        userFactors = self._eval_update_userFactors(userFactors, new_userFactors)
+        items_to_update = items_to_update.select(sqlfun.explode('new_itemFactors')\
+                                                       .alias('new_itemFactors'))
+        items_to_update = items_to_update.select(col('new_itemFactors').getField('id')\
+                                                         .alias('new_id'),
+                                                 col('new_itemFactors').getField('features')\
+                                                         .alias('new_features'))
+        items_to_update = items_to_update.groupby('new_id')\
+                                         .agg(sqlfun.collect_list('new_features')\
+                                                    .alias('new_features_list'))
+        items_to_update = items_to_update.select('new_id',
+                                                 get_avg('new_features_list')\
+                                                     .alias('new_features'))
         
-        new_itemFactors = factors_ratings[['movieId', 'features']]
-        new_itemFactors = [tuple(row) for _,row in new_itemFactors.iterrows()]
-        new_itemFactors = [(int(mid), list(features)) for mid,features in new_itemFactors]
-        new_itemFactors = spark.createDataFrame(new_itemFactors, 
-                                                schema=new_latentFactor_schema)
-        itemFactors = self._eval_update_itemFactors(itemFactors, new_itemFactors)
+        new_userFactors = update_latentFactors(userFactors, users_to_update)
+        timestamp = time.time()
+#        print('Caching new userFactors DF and unpersisting old...')
+        new_userFactors = new_userFactors.cache().localCheckpoint()
+        new_userFactors.count()
+        userFactors.unpersist()
+#        print('Time: {}'.format(round(time.time()-timestamp, 2)))
+#        print('Number of persistent RDDs: {}'\
+#              .format(len(spark.sparkContext._jsc.getPersistentRDDs())))
         
-        return userFactors, itemFactors
+        new_itemFactors = update_latentFactors(itemFactors, items_to_update)
+        timestamp = time.time()
+#        print('Caching new train_itemFactors DF and unpersisting old...')
+        new_itemFactors = new_itemFactors.cache().localCheckpoint()
+        new_itemFactors.count()
+#        print('Count of new train_itemFactors: ')
+#        print(new_itemFactors.count())
+        itemFactors.unpersist()
+#        print('Time: {}'.format(round(time.time()-timestamp, 2)))
+#        print('Number of persistent RDDs: {}'\
+#              .format(len(spark.sparkContext._jsc.getPersistentRDDs())))
+        
+        return new_userFactors, new_itemFactors
     
-    def _eval_update_userFactors(self, userFactors, new_factors):
+    def _eval_get_scores(self, scores, validation_sets, userFactors,
+                         itemFactors):
         """
-        Helper function for evaluation. Updates old user latent factors
-        with new entries in new_userFactors.
+        Helper function for evaluation. 
+        Computes SSE for each user in validation_sets and appends as a new
+        column to scores.
         
-        :returns: updated_userFactors
+        :returns: updated_scores
         """
-        join_condition = userFactors.id==new_factors.new_id
+        scoring_df = validation_sets.select(sqlfun.explode('validation_set')\
+                                                  .alias('val_set'))
+        scoring_df = scoring_df.select(col('val_set').getField('userId').alias('userId2'),
+                                       col('val_set').getField('movieId').alias('movieId'),
+                                       col('val_set').getField('rating').alias('rating'))
         
-        userFactors = userFactors.join(new_factors,
-                                         on=join_condition,
-                                         how='outer')
-        userFactors = userFactors\
-                       .withColumn('new_features',
-                                   sqlfun.when(userFactors\
-                                                   .new_features\
-                                                   .isNotNull(),
-                                               userFactors\
-                                                   .new_features)\
-                                          .otherwise(userFactors\
-                                                         .features))
-        userFactors = userFactors\
-                       .select(sqlfun.coalesce(userFactors.id,
-                                               userFactors.new_id)\
-                                     .alias('id'),
-                               userFactors.new_features.alias('features'))
+        scoring_df = scoring_df.join(userFactors,
+                                     scoring_df.userId2==userFactors.id,
+                                     how='left')\
+                               .select('userId2',
+                                       'movieId',
+                                       'rating',
+                                       col('features').alias('userFactors'))
+        scoring_df = scoring_df.join(itemFactors,
+                                     scoring_df.movieId==itemFactors.id,
+                                     how='left')\
+                               .select('userId2',
+                                       'rating',
+                                       'userFactors',
+                                       col('features').alias('itemFactors'))
+        scoring_df = scoring_df.select('userId2',
+                                       'rating',
+                                       sqlfun.arrays_zip('userFactors',
+                                                         'itemFactors')\
+                                              .alias('paired_factors'))
+        scoring_df = scoring_df.select('userId2',
+                                       'rating',
+                                       dot_product('paired_factors')\
+                                       .alias('pred'))
+        scoring_df = scoring_df.select('userId2',
+                                       ((col('rating')-col('pred'))**2)\
+                                       .alias('se'))
+        scoring_df = scoring_df.groupby('userId2').agg(sqlfun.sum(col('se'))\
+                                                       .alias('sse'))
+        updated_scores = scores.join(scoring_df,
+                                     scores.userId==scoring_df.userId2,
+                                     how='left')
+        updated_scores = updated_scores.drop('userId2')
         
-        return userFactors
-    
-    def _eval_update_itemFactors(self, itemFactors, new_factors):
-        """
-        Helper function for evaluation. Updates old item latent factors with
-        new entries in new_itemFactors.
-        
-        :returns: updated_itemFactors
-        """
-        join_condition = itemFactors.id==new_factors.new_id
-        
-        itemFactors = itemFactors.join(new_factors,
-                                         on=join_condition,
-                                         how='outer')
-        itemFactors = itemFactors\
-                       .withColumn('new_features',
-                                   sqlfun.when(itemFactors\
-                                                   .new_features\
-                                                   .isNotNull(),
-                                               itemFactors.\
-                                                   new_features)\
-                                          .otherwise(itemFactors\
-                                                         .features))
-        itemFactors = itemFactors\
-                       .select(sqlfun.coalesce(itemFactors.id,
-                                               itemFactors.new_id)\
-                                     .alias('id'),
-                               itemFactors.new_features.alias('features'))
-        
-        return itemFactors
-    
-    def _eval_predict(self, user, val_items, userFactors, itemFactors):
-        """
-        Helper function for evaluation. Makes predictions for user on items
-        in val_items. Uses supplied latent factors.
-        
-        :returns: list of float predictions
-        """
-        w = userFactors.filter(col('id')==user).collect()[0][1]
-        w = np.array(w)
-        H = itemFactors.filter(col('id').isin(val_items)).select('id', 
-                                                                 'features')\
-                                                         .collect()
-        preds = []
-        for item in val_items:
-            h = list(filter(lambda x: x[0]==item, H))[0][1]
-            h = np.array(h)
-            preds.append(w.dot(h))
-        
-        return preds
+        return updated_scores
     
     def _eval_get_elbow_index(self, rmse_list, alpha):
         """
@@ -1059,14 +807,149 @@ class collectionRecommender(object):
         """
         return (1+(elbow_index-1)/len(rmse_list))*rmse_list[-1]
     
-#    def crossValidate(self):
-#        pass
-#    def save(self):
-#        pass
-#    def load(self):
-#        pass
+    def save(self, save_dir, refit = False, save_ratings = False,
+             save_preds = False):
+        if not os.path.exists(save_dir):
+            print('Specified directory does not exist.')
+            return None
+        if refit:
+            print('Refitting on full training data...')
+            self.fit()
+        print('Saving latent user factors...')
+        self.userFactors.write.json(os.path.join(save_dir, 'userFactors'))
+        print('Saving latent item factors...')
+        self.itemFactors.write.json(os.path.join(save_dir, 'itemFactors'))
+        if save_ratings:
+            print('Saving ratings matrix...')
+            self.ratings.write.json(os.path.join(save_dir, 'ratings'))
+        if save_preds:
+            print('Saving predictions...')
+            self.predictions.write.json(os.path.join(save_dir, 'predictions'))
+        print('Saving metadata...')
+        metadata = {}
+        metadata['als_params'] = self.als_params
+        metadata['userCol'] = self.userCol
+        metadata['itemCol'] = self.itemCol
+        metadata['ratingCol'] = self.ratingCol
+        metadata['ownership_conversion'] = self.ownership_conversion
+        metadata['update_threshold'] = self.update_threshold
+        metadata['predicted_users'] = self.predicted_users
+        metadata['updated_users'] = self.updated_users
+        metadata['updated_movies'] = self.updated_movies
+        metadata['train_users'] = self.train_users
+        metadata['train_movies'] = self.train_movies
+        if not os.path.exists(os.path.join(save_dir, 'metadata')):
+            Path(os.path.join(save_dir, 'metadata')).touch()
+        json.dump(metadata, open(os.path.join(save_dir, 'metadata'), 'w'))
+        
+    def load(self, load_dir):
+        if not os.path.exists(load_dir):
+            print('Specified load directory does not exist.')
+            return None
+        print('Loading metadata...')
+        metadata = json.load(open(os.path.join(load_dir, 'metadata'), 'r'))
+        meta_keys = list(metadata.keys())
+        if 'als_params' in meta_keys:
+            self.als_params = metadata['als_params']
+        if 'userCol' in meta_keys:
+            self.userCol = metadata['userCol']
+        if 'itemCol' in meta_keys:
+            self.itemCol = metadata['itemCol']
+        if 'ratingCol' in meta_keys:
+            self.ratingCol = metadata['ratingCol']
+        if 'ownership_conversion' in meta_keys:
+            self.ownership_conversion = metadata['ownership_conversion']
+        if 'update_threshold' in meta_keys:
+            self.update_threshold = metadata['update_threshold']
+        if 'predicted_users' in meta_keys:
+            self.predicted_users = metadata['predicted_users']
+        if 'updated_users' in meta_keys:
+            self.updated_users = metadata['updated_users']
+        if 'updated_movies' in meta_keys:
+            self.updated_movies = metadata['updated_movies']
+        if 'train_users' in meta_keys:
+            self.train_users = metadata['train_users']
+        if 'train_movies' in meta_keys:
+            self.train_movies = metadata['train_movies']
+        self.als = ALS(**self.als_params, userCol=self.userCol, 
+                       itemCol=self.itemCol, ratingCol=self.ratingCol,
+                       nonnegative=True)
+        
+        latentFactor_schema = StructType([StructField('id', IntegerType()),
+                                          StructField('features', 
+                                                        ArrayType(FloatType()))])
+        print('Loading latent factors...')
+        self.userFactors = spark.read.json(os.path.join(load_dir, 'userFactors'),
+                                           schema=latentFactor_schema)
+        self.itemFactors = spark.read.json(os.path.join(load_dir, 'itemFactors'),
+                                           schema=latentFactor_schema)
+        
+        
+    
+        if os.path.exists(os.path.join(load_dir, 'ratings')):
+            print('Loading ratings...')
+            ratings_schema = StructType([StructField('userId',IntegerType(), True),
+                                         StructField('movieId',IntegerType(), True),
+                                         StructField('rating',FloatType(), True)])
+            self.ratings = spark.read.json(os.path.join(load_dir, 'ratings'),
+                                           schema=ratings_schema)
+        
+        
+        if os.path.exists(os.path.join(load_dir, 'predictions')):
+            print('Loading predictions...')
+            preds_schema = StructType([StructField('userId',IntegerType(), True),
+                                       StructField('movieId',IntegerType(), True),
+                                       StructField('predictedRating',FloatType(), True)])
+            self.predictions = spark.read.json(os.path.join(load_dir, 'predictions'),
+                                               schema=preds_schema)
 #    def updateParams(self):
 #        pass
+ 
+def recommender_crossValidate(ratings, param_grids, num_folds=3, seed=9,
+                              max_training_samples = 20):
+    users = [u[0] for u in ratings.select('userId').distinct().collect()]
+    users = list(int(x) for x in np.random.permutation(users))
+    n_users = len(users)
+    print('Total users: {}'.format(n_users))
+    fold_size = int(n_users/num_folds)
+    print('Fold size: {}'.format(fold_size))
     
+    results_list = []
+    
+    rmse_names = ['rmse{}'.format(i) for i in range(max_training_samples)]
+    
+    overall_time = time.time()
+    for pg in param_grids:
+        param_names = list(pg.keys())
+        result_columns = param_names + ['fold'] + rmse_names
+        result_df = pd.DataFrame(columns=result_columns)
         
-
+        for p in product_dict(**pg):
+            param_timestamp = time.time()
+            print('Current Params:')
+            print(p)
+            cr = collectionRecommender(**p)
+            for i in range(num_folds):
+                fold_timestamp = time.time()
+                print('Fold {}...'.format(i))
+                fold_dict = {'fold': i}
+                test_users = users[i*fold_size:(i+1)*fold_size]
+                train_users = list(set(users).difference(set(test_users)))
+                test = ratings.filter(col('userId').isin(test_users))
+                train = ratings.filter(col('userId').isin(train_users))
+                print('Training model...')
+                cr.fit(train)
+                print('Evaluating model...')
+                scores = cr.evaluate_withRatings(test, cr.itemFactors)[0]
+                scores = dict(zip(rmse_names, scores))
+                p.update(fold_dict)
+                p.update(scores)
+                result_df = result_df.append(p, ignore_index=True)
+                spark.catalog.clearCache()
+                print('Fold finished. Time: {}'.format(round(time.time()-fold_timestamp,2)))
+                print(result_df.to_string())
+            del cr
+            print('Params finished. Time: {}'.format(round(time.time()-param_timestamp,2)))
+        results_list.append(result_df)
+    print('Total time: {}'.format(time.time()-overall_time, 2))
+    return results_list

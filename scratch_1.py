@@ -870,10 +870,73 @@ test_user_pd.drop(columns='genome',inplace=True)
 test_user_pd.to_csv('datasets/collection_info_127765.csv', index=False)
 test_user_genomes.to_csv('datasets/collection_genomes_127765.csv', index=False)
 
-    
+
+#%%
+
+# To initialize Spark session:
+
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SparkSession
+
+from pyspark.sql.types import StructType,StructField,ArrayType,\
+                    IntegerType,FloatType, StringType
+
+from pyspark.sql.functions import struct, collect_list, col
+
+spark_home = '/usr/local/spark'
+conf = SparkConf()\
+       .setMaster('local')\
+       .setSparkHome(spark_home)\
+       .setAppName('film_buff')\
+       .set('spark.network.timeout', 10000000)
+#       .set('spark.driver.memory', '2g')\
+#       .set('spark.executor.memory', '2g')
+sc = SparkContext(conf=conf)
+spark = SparkSession(sc)
 
 
 
+#%%
+# Script for testing eval function
+
+ratings_schema = StructType([StructField('userId', IntegerType()), 
+                             StructField('movieId', IntegerType()), 
+                             StructField('rating', FloatType())])              
+ml_data = spark.read.csv('datasets/ml-latest/ratings_1000_users.csv',
+                         header=True,
+                         schema=ratings_schema)
+users = [u[0] for u in ml_data.select('userId').distinct().collect()]
+num_test_users = 100
+test_users = users[:num_test_users]
+train_users = users[num_test_users:]
+test = ml_data.filter(col('userId').isin(test_users))
+train = ml_data.filter(col('userId').isin(train_users))
+test_96224 = ml_data.filter('userId=96224')
+
+cr = collectionRecommender(rank=10, maxIter=5)
+cr.fit(train)
+
+# PICK ONE:
+
+#scores_96224 = cr.evaluate_withRatings(test_96224, cr.itemFactors)
+
+scores = cr.evaluate_withRatings(test, cr.itemFactors)
+
+#%%
+
+# Script to test CV function
+
+ratings_schema = StructType([StructField('userId', IntegerType()), 
+                             StructField('movieId', IntegerType()), 
+                             StructField('rating', FloatType())])              
+ml_data = spark.read.csv('datasets/ml-latest/ratings_1000_users.csv',
+                         header=True,
+                         schema=ratings_schema)
+
+param_grids = [{'regParam':[0.1, 1], 'rank':[10], 'maxIter':[5]}]
+
+CV_scores = recommender_crossValidate(ml_data, param_grids = param_grids,
+                                      num_folds = 10)
 
 
 
